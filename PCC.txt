@@ -1,0 +1,204 @@
+CreditManager Rate_Limiter{
+	expose Float r;
+	expose Int cap;
+	Int tokens, last_time = now;
+
+	def deq_criteria(Packet pkt): Pred{
+		return (pkt.send_time = now);
+	}
+
+	def on_enqueue(Packet pkt){
+		tokens = tokens + r * ( now - last_time )
+		if (tokens > cap){
+			tokens = cap;
+		}
+		if (pkt.length <= tokens){
+			pkt.send_time = now;
+		}
+		else{
+			pkt.send_time = now + ( pkt.length - tokens ) / r;
+		}
+		tokens = tokens - pkt.length;
+		last_time = now;
+	}
+
+	def on_dequeue(Packet pkt){}
+}
+
+Metric avg_rtt{
+	Float sum_rtt;
+	Int sample_cnt;
+
+	def init(){
+		val = 0;
+		start_time = 0;
+	}
+
+	def update(new_ack_rcvd pkt){
+		sum_rtt += pkt.rtt;
+		sample_cnt += 1;
+	}
+
+	def Val(){
+		return (sum_rtt / sample_cnt);
+	}
+
+}
+
+Metric max_sent{
+	Int val;
+
+	def init(){
+		val = 0;
+	}
+
+	def update(pkt_sent pkt){
+		if (pkt.tcp.seq > val){
+			val = pkt.tcp.seq;
+		}
+	}
+
+	def Val(){
+		return val;
+	}
+}
+
+Metric acked_pkts{
+	Int val;
+
+	def init(){
+		val = 0;
+	}	
+
+	def update(new_ack_rcvd pkt){
+		val += 1;
+	}
+
+	def Val(){
+		return val;
+	}
+}
+
+ASM PCC<Token_Bucket>{
+	Bool more, decided;
+	Float epsilon;
+	Float prev_rate;
+	Float u1, u2, u3, u4, prev_u, u;
+	Float alpha;
+
+	Float loss_rate;
+	Int start_max_sent, start_acked_pkts;
+
+	Timer t;
+
+	State Idle{
+		t.reset(avg_rtt);
+	};
+
+	State Normal{
+		start_max_sent = max_sent;
+		start_acked_pkts = acked_pkts;
+		if (more){
+			cm.r = cm.r * (1 + epsilon);
+		}
+		else{
+			cm.r = cm.r * (1 - epsilon);
+		}
+		t.reset(avg_rtt);
+	};
+
+	State Check{
+		prev_u = u;
+		loss_rate = (acked_pkts - start_acked_pkts) /
+					(max_sent - start_max_sent);
+		u = cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - cm.r * loss_rate;
+	};
+
+	State Test1{
+		start_max_sent = max_sent;
+		start_acked_pkts = acked_pkts;
+		prev_rate = cm.r;
+		cm.r = cm.r * (1 + epsilon);
+		t.reset(avg_rtt);
+	};
+
+	State Test2{
+		loss_rate = (acked_pkts - start_acked_pkts) /
+					(max_sent - start_max_sent);
+		u1 = cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - cm.r * loss_rate;
+
+		start_max_sent = max_sent;
+		start_acked_pkts = acked_pkts;
+		prev_rate = cm.r;
+		cm.r = cm.r * (1 - epsilon);
+		t.reset(avg_rtt);
+	};
+
+	State Test3{
+		loss_rate = (acked_pkts - start_acked_pkts) /
+					(max_sent - start_max_sent);
+		u2 = cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - cm.r * loss_rate;
+
+		start_max_sent = max_sent;
+		start_acked_pkts = acked_pkts;
+		prev_rate = cm.r;
+		cm.r = cm.r * (1 + epsilon);
+		t.reset(avg_rtt);
+	};
+
+	State Test4{
+		loss_rate = (acked_pkts - start_acked_pkts) /
+					(max_sent - start_max_sent);
+		u3 = cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - cm.r * loss_rate;
+
+		start_max_sent = max_sent;
+		start_acked_pkts = acked_pkts;
+		prev_rate = cm.r;
+		cm.r = cm.r * (1 + epsilon);
+		t.reset(avg_rtt);
+	};
+
+	State Decide{
+		loss_rate = (acked_pkts - start_acked_pkts) /
+					(max_sent - start_max_sent);
+		u4 = cm.r * (1 - loss_rate) * 
+			 1 / (1 + e ** (alpha * loss_rate - 0.05)) 
+			 - cm.r * loss_rate;
+		if (u1 > u && u3 > u){
+			more = True;
+			decided = True;
+		}
+		else if (u2 > u && u4 > u){
+			more = False;
+			decided = True;
+		}
+		else{
+			decided = False;
+		}
+	}
+
+	Init Test1;
+
+	Transtions{
+		| Idle on t.timeout ==> Check
+		| Normal on t.timeout ==> Check
+		| Check on always if u >= prev_u && decided ==> Normal
+		| Check on always if u >= prev_u && !decided ==> Idle
+		| Check on always if u < prev_u ==> Test1
+		| Test1 on t.timeout ==> Test2
+		| Test2 on t.timeout ==> Test3
+		| Test3 on t.timeout ==> Test4
+		| Test4 on t.timeout ==> Decide
+		| Decide on always if decided ==> Normal
+		| Decide on always if !decided ==> Idle
+	}
+}
+
