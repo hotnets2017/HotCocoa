@@ -1,0 +1,183 @@
+CreditManager Sliding_Window{
+	expose Int size;
+	Int start;
+
+	def deq_criteria(Packet pkt): Pred{
+		return (pkt.tcp.seq >= start && 
+		        pkt.tcp.seq < start + window);
+	}
+
+	def on_enqueue(Packet pkt){}
+	def on_dequeue(Packet pkt){}
+	def on_ack_rcvd(Packet pkt){
+		if (pkt.tcp.seq >= start &&
+		    pkt.tcp.seq < start + window){
+		    start = pkt.tcp.seq;
+		}
+	}
+}
+
+Metric dup_acks{
+	Int val, last_ack;
+
+	def init(){
+		last_ack = None;
+		val = 0;
+	}
+
+	def update(ack_rcvd pkt){
+		Int new_ack = pkt.tcp.seq;
+		if (last_ack == None){
+			last_ack = new_ack;
+			val += 1;
+		}
+		else if (last_ack == new_ack){
+			val += 1;		
+		}
+		else if (new_ack > last_ack){
+			last_ack = new_ack;
+			val = 0;
+		}
+	}
+
+	def Val(){
+		return val;
+	}
+}
+
+
+Metric rtx_timeout{
+	Bool val;
+	Timer t;
+	Int timeout_interval = 200ms;
+
+	def init(){
+		val = false;
+		rcvd = false;
+	}
+
+	def update(new_ack_rcvd pkt){
+		val = false;
+		t.reset(timeout_interval);
+	}
+
+	def update((ack_rcvd if dup_acks = 3) pkt){
+		val = false;
+		t.reset(timeout_interval);
+	}
+
+	def update(t.timeout interval){
+		val = true;
+		t.reset(timeout_interval);
+	}
+
+	def Val(){
+		return val;
+	}
+}
+
+Metric max_ack{
+	Int val;
+
+	def init(){
+		val = 0;
+	}
+
+	def update(ack_rcvd pkt){
+		if (pkt.tcp.seq > val){
+			val = pkt.tcp.seq;
+		}
+	}
+
+	def Val(){
+		return val;
+	}
+}
+
+Metric max_sent{
+	Int val;
+
+	def init(){
+		val = 0;
+	}
+
+	def update(pkt_sent pkt){
+		if (pkt.tcp.seq > val){
+			val = pkt.tcp.seq;
+		}
+	}
+
+	def Val(){
+		return val;
+	}
+}
+
+
+ASM tcp_reno<Sliding_Window>(Float ssthresh){
+	Float tmp_win; 
+	Int recovery_seq;
+	Float ss_threshold = 2 * ssthresh;
+
+	State Start{
+		tmp_win = 1;
+		CM.size = 1;
+		recovery_seq = max_sent;
+		ss_threshod /= 2;
+	}
+
+	State SlowStart {
+		tmp_win += 1;
+		CM.size += 1;
+	};
+
+	State AI {
+		CM.size = tmp_win;
+		CM.size += 1/CM.size;
+		tmp_win += 1/tmp_win;
+	};
+
+	State MD {
+		recovery_seq = 0;
+		tmp_win = CM.size / 2;
+		ss_threshold = tmp_win;
+		CM.size = tmp_win + dup_acks;
+	};
+
+	State FR{
+		CM.size = tmp_win + dup_acks;
+	};
+
+	State Idle {};
+
+	Init Start;
+
+	Transitions{
+		| Start on new_ack_rcvd ==> SlowStart
+
+		| SlowStart on new_ack_rcvd if CM.size < ss_threshold ==> SlowStart
+		| SlowStart on new_ack_rcvd if CM.size < ss_threshold ==> SlowStart
+		| SlowStart on new_ack_rcvd if CM.size >= ss_threshold ==> AI
+		| SlowStart on ack_rcvd if dup_acks = 3 && max_ack > recovery_seq ==> MD
+		| SlowStart on ack_rcvd if dup_acks = 3 && max_ack <= recovery_seq ==> Idle
+		| SlowStart on rtx_timeout ==> Start
+
+		| AI on new_ack_rcvd ==> AI
+		| AI on ack_rcvd if dup_acks = 3 && max_ack > recovery_seq ==> MD
+		| AI on ack_rcvd if dup_acks = 3 && max_ack <= recovery_seq ==> Idle
+		| AI on rtx_timeout ==> Start
+
+		| MD on new_ack_rcvd ==> AI
+		| MD on ack_rcvd if dup_acks > 0 ==> FR
+		| MD on rtx_timeout ==> Start
+
+		| FR on new_ack_rcvd ==> AI
+		| FR on ack_rcvd if dup_acks > 0 ==> FR
+		| FR on rtx_timeout ==> Start
+
+		| Idle on new_ack_rcvd if CM.size < ss_threshold ==> SlowStart
+		| Idle on new_ack_rcvd if CM.size >= ss_threshold ==> AI
+		| Idle on rtx_timeout ==> Start
+	};
+	
+}
+   
